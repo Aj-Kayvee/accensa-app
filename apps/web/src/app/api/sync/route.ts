@@ -7,7 +7,13 @@ import {
   setLastSyncedLedger,
   getSyncState,
 } from '@/lib/db';
-import { sweepLedgerRange, EVENTS_PAGE_LIMIT, type EventPage } from '@/lib/event-pager';
+import {
+  sweepLedgerRange,
+  parallelSweepLedgerRange,
+  PARALLEL_SYNC_THRESHOLD,
+  EVENTS_PAGE_LIMIT,
+  type EventPage,
+} from '@/lib/event-pager';
 import { cooldownRemaining } from '@/lib/sync-status';
 
 export const dynamic = 'force-dynamic';
@@ -155,39 +161,49 @@ async function runSync(merchant: string, opts: { cooldownMs?: number } = {}) {
       // The limit belongs under `pagination`; sent at the top level the RPC
       // ignores it and applies its own default.
       const deadline = Date.now() + PAGING_BUDGET_MS;
-      const { events, sweptThrough, complete, pages, windows } = await sweepLedgerRange(
-        ({ startLedger: from, endLedger: to, cursor: pageCursor }) =>
-          rpc<EventPage>('getEvents', {
-            ...(pageCursor ? {} : { startLedger: from, endLedger: to }),
-            filters,
-            pagination: { limit: EVENTS_PAGE_LIMIT, ...(pageCursor ? { cursor: pageCursor } : {}) },
-            xdrFormat: 'base64',
-          }),
-        { startLedger, endLedger: latestLedger, withinBudget: () => Date.now() < deadline },
-      );
+      const fetchPage = ({
+        startLedger: from,
+        endLedger: to,
+        cursor: pageCursor,
+      }: {
+        startLedger?: number;
+        endLedger?: number;
+        cursor?: string;
+      }) =>
+        rpc<EventPage>('getEvents', {
+          ...(pageCursor ? {} : { startLedger: from, endLedger: to }),
+          filters,
+          pagination: {
+            limit: EVENTS_PAGE_LIMIT,
+            ...(pageCursor ? { cursor: pageCursor } : {}),
+          },
+          xdrFormat: 'base64',
+        });
 
+      const gap = latestLedger - startLedger + 1;
+      const sweepFn = gap > PARALLEL_SYNC_THRESHOLD ? parallelSweepLedgerRange : sweepLedgerRange;
       let inserted = 0;
       let decoded = 0;
+      const processEvents = async (events: EventPage['events']) => {
+        for (const event of events) {
+          const transferEvent = decodeTransferEvent(event);
+          // A malformed or non-transfer event must not stall the batch.
+          if (!transferEvent) continue;
+          decoded++;
 
-      for (const event of events) {
-        const transferEvent = decodeTransferEvent(event);
-        // A malformed or non-transfer event must not stall the batch.
-        if (!transferEvent) continue;
-        decoded++;
+          // Defensive: never record a transfer that is not to this merchant.
+          if (transferEvent.to !== merchant) continue;
 
-        // Defensive: never record a transfer that is not to this merchant.
-        if (transferEvent.to !== merchant) continue;
-
-        // DO UPDATE, not DO NOTHING: a row may already exist because the
-        // merchant reported route attribution before this transfer was
-        // indexed, which is the normal ordering — the hook fires the moment
-        // x402 settles, this job runs on a schedule. Skipping the conflict
-        // would leave that row permanently null and invisible.
-        //
-        // Only ledger-owned columns are written. route, method, request_id and
-        // hook_reported_at belong to the merchant's report and are left alone.
-        const res = await client.query(
-          `INSERT INTO payments (tx_hash, ledger, payer, amount, asset, ts)
+          // DO UPDATE, not DO NOTHING: a row may already exist because the
+          // merchant reported route attribution before this transfer was
+          // indexed, which is the normal ordering — the hook fires the moment
+          // x402 settles, this job runs on a schedule. Skipping the conflict
+          // would leave that row permanently null and invisible.
+          //
+          // Only ledger-owned columns are written. route, method, request_id and
+          // hook_reported_at belong to the merchant's report and are left alone.
+          const res = await client.query(
+            `INSERT INTO payments (tx_hash, ledger, payer, amount, asset, ts)
   VALUES ($1, $2, $3, $4::numeric, $5, $6::timestamptz)
   ON CONFLICT (tx_hash) DO UPDATE
   SET ledger = EXCLUDED.ledger,
@@ -196,37 +212,45 @@ async function runSync(merchant: string, opts: { cooldownMs?: number } = {}) {
   asset = EXCLUDED.asset,
   ts = EXCLUDED.ts
   WHERE payments.ledger IS NULL RETURNING *`,
-          [
-            transferEvent.txHash,
-            transferEvent.ledger,
-            transferEvent.from,
-            transferEvent.amount, // string - never a float
-            transferEvent.asset,
-            transferEvent.ledgerClosedAt,
-          ],
-        );
-        if (res.rowCount && res.rowCount > 0 && process.env.WEBHOOK_URL) {
-          const payment = res.rows[0];
-          const timeoutMs = 2000;
-          for (let i = 0; i < 3; i++) {
-            try {
-              const controller = new AbortController();
-              const id = setTimeout(() => controller.abort(), timeoutMs);
-              const webhookRes = await fetch(process.env.WEBHOOK_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payment),
-                signal: controller.signal,
-              });
-              clearTimeout(id);
-              if (webhookRes.ok || webhookRes.status < 500) break;
-            } catch {
-              // A webhook the merchant cannot receive must not stall indexing.
+            [
+              transferEvent.txHash,
+              transferEvent.ledger,
+              transferEvent.from,
+              transferEvent.amount, // string - never a float
+              transferEvent.asset,
+              transferEvent.ledgerClosedAt,
+            ],
+          );
+          if (res.rowCount && res.rowCount > 0 && process.env.WEBHOOK_URL) {
+            const payment = res.rows[0];
+            const timeoutMs = 2000;
+            for (let i = 0; i < 3; i++) {
+              try {
+                const controller = new AbortController();
+                const id = setTimeout(() => controller.abort(), timeoutMs);
+                const webhookRes = await fetch(process.env.WEBHOOK_URL, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(payment),
+                  signal: controller.signal,
+                });
+                clearTimeout(id);
+                if (webhookRes.ok || webhookRes.status < 500) break;
+              } catch {
+                // A webhook the merchant cannot receive must not stall indexing.
+              }
             }
           }
+          inserted += res.rowCount ?? 0;
         }
-        inserted += res.rowCount ?? 0;
-      }
+      };
+
+      const { sweptThrough, complete, pages, windows, scanned } = await sweepFn(fetchPage, {
+        startLedger,
+        endLedger: latestLedger,
+        withinBudget: () => Date.now() < deadline,
+        onEvents: processEvents,
+      });
 
       // The sweep only ever reports whole windows, so this is safe whether or
       // not it reached the head. Crucially it advances across empty windows
@@ -242,7 +266,7 @@ async function runSync(merchant: string, opts: { cooldownMs?: number } = {}) {
         drained: complete,
         pages,
         windows,
-        scanned: events.length,
+        scanned,
         decoded,
         inserted,
       };
