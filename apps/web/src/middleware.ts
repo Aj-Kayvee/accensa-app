@@ -29,9 +29,7 @@ function getClientIp(request: NextRequest): string {
 
 function isPublicApiRoute(path: string): boolean {
   return (
-    path.startsWith('/api/verify') ||
-    path.startsWith('/api/auth') ||
-    path.startsWith('/api/hook/')
+    path.startsWith('/api/verify') || path.startsWith('/api/auth') || path.startsWith('/api/hook/')
   );
 }
 
